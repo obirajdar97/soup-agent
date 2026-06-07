@@ -1,24 +1,27 @@
 """
-SOUP & Tool Agent v6.6 — AI Validation Suggestions + Tool Enrichment Parity
+SOUP & Tool Agent v6.6.1 — 'Other' Ecosystem for Non-Registry Tools
 ===================================================
 For QARA professionals managing SOUP (IEC 62304 §5.3.3) and Tools
 (§5.1.4 + FDA CSA — Final, Sept 2025, updated Feb 2026).
 
-v6.6 changes (this release):
+v6.6.1 changes (this patch):
+  - NEW: 'Other' ecosystem option for tools that aren't in a public package
+    registry (Jira, licensed IDEs, internal scripts). Selecting it:
+      • skips deps.dev/OSV/NVD enrichment by design (no meaningless 404s/diagnostics)
+      • shows a clear "fill metadata manually" banner instead of an error panel
+      • leaves Publisher blank for manual entry (not the literal word "Other")
+      • is SKIPPED on periodic refresh, so manually-entered license/details are
+        never overwritten with blanks
+  - Rationale: Ecosystem cannot simply be removed — it is part of the row identity
+    (Name+Version+Ecosystem) used for every save/update/delete, AND it drives
+    enrichment for registry-based tools (eslint, pytest, etc.). 'Other' gives
+    non-registry tools a clean path without breaking either.
+
+v6.6 changes:
   - Confirmed: Tools use the SAME enrich() function as SOUP, so the v6.5/v6.5.1
-    enrichment fixes (deps.dev casing, OSV PyPI normalization, dependency-free
-    CVSS 3.1, NVD key support, diagnostics) already apply to Tools. No duplication.
-  - NEW: AI suggest for Validation Approach Justification (Tool Review tab)
-  - NEW: AI suggest for Validation Evidence (Tool Review tab)
-  - NEW: AI suggest for Tool Output Verification (Tool Review tab)
-    Design note: these AI buttons live in the Tool Review tab (a deliberate
-    exception to "AI only in Add Item"), because they depend on the Tool Risk
-    Level and Validation Approach set by the guided picker in Review, not Add Item.
-    Rule-based suggest_validation_approach() still provides the safe regulatory
-    default; AI enriches the package-specific prose on top. All AI output is tagged
-    [AI-suggested], fully editable, prefix stripped before saving. Evidence carries
-    an explicit "verify every claim" caution so unverified adoption figures don't
-    enter a regulated record.
+    enrichment fixes already apply to Tools. No duplication.
+  - NEW: AI suggest for Validation Approach Justification, Validation Evidence,
+    and Tool Output Verification (Tool Review tab).
 
 v6.5.1 changes (patch):
   - Fix: A clean package with 0 known vulnerabilities is no longer presented as a
@@ -87,7 +90,11 @@ ECOSYSTEMS = {
     "Go": "Go modules",
     "Cargo": "Cargo — Rust",
     "RubyGems": "RubyGems — Ruby",
+    "Other": "Other / not a package (e.g. Jira, IDE, internal script) — no auto-enrichment",
 }
+
+# Sentinel for non-registry items: enrich() skips all API calls for this ecosystem.
+NON_REGISTRY_ECO = "Other"
 
 USAGE_CONTEXT_OPTIONS = [
     "Production (runtime)",
@@ -1085,10 +1092,21 @@ def enrich(eco, name, version, item_type="SOUP"):
     # Reset diagnostics for this enrichment run so the UI shows only current reasons.
     st.session_state["_enrich_diag"] = []
 
-    meta = fetch_depsdev(eco, name, version)
-    latest = fetch_depsdev_latest(eco, name)
-    is_outdated = bool(latest and latest != version)
-    vulns = fetch_osv_vulns(eco, name, version)
+    # Non-registry items (Jira, IDEs, internal scripts) have no package registry to
+    # query. Skip deps.dev/OSV/NVD entirely and return a clean empty-enrichment record
+    # so the user can fill metadata manually. This avoids meaningless 404s/diagnostics.
+    if eco == NON_REGISTRY_ECO:
+        meta = {}
+        latest = ""
+        is_outdated = False
+        vulns = []
+        _diag("Non-registry item ('Other'): automatic enrichment skipped by design. "
+              "Enter Publisher, License, and any known issues manually.")
+    else:
+        meta = fetch_depsdev(eco, name, version)
+        latest = fetch_depsdev_latest(eco, name)
+        is_outdated = bool(latest and latest != version)
+        vulns = fetch_osv_vulns(eco, name, version)
     
     cves = []
     highest_cvss = 0.0
@@ -1135,7 +1153,7 @@ def enrich(eco, name, version, item_type="SOUP"):
     repo_url = next((l.get("url", "") for l in links if l.get("label") == "SOURCE_REPO"), "")
     homepage = next((l.get("url", "") for l in links if l.get("label") == "HOMEPAGE"), "")
     issues = next((l.get("url", "") for l in links if l.get("label") == "ISSUE_TRACKER"), "")
-    publisher = _derive_publisher(eco, repo_url, homepage)
+    publisher = "" if eco == NON_REGISTRY_ECO else _derive_publisher(eco, repo_url, homepage)
     description = (meta.get("description") or "")[:500] or f"{name} {version}"
     release_date = meta.get("publishedAt", "") or meta.get("publishedDate", "")
     
@@ -1203,6 +1221,10 @@ def refresh_all(trigger="manual"):
     for sheet_name, df, item_type in [(SOUP_SHEET, soup_df, "SOUP"), (TOOL_SHEET, tool_df, "Tool")]:
         for _, row in df.iterrows():
             try:
+                # Non-registry items have no registry to re-query; enrichment would
+                # overwrite manually-entered metadata with blanks. Skip them on refresh.
+                if row.get("Ecosystem") == NON_REGISTRY_ECO:
+                    continue
                 old = safe_int(row.get("CVE Count"))
                 rec = enrich(row["Ecosystem"], row["Name"], str(row["Version"]), item_type)
                 diff = rec["CVE Count"] - old
@@ -1557,11 +1579,18 @@ with tab1:
     with col1:
         ecosystem = st.selectbox("Ecosystem", list(ECOSYSTEMS.keys()),
                                   format_func=lambda x: ECOSYSTEMS[x],
-                                  help="The registry your developer uses to download this package.")
+                                  help="The registry your developer uses to download this package. "
+                                       "Choose 'Other' for tools that aren't packages (Jira, IDEs, "
+                                       "internal scripts) — enrichment is skipped and you enter details manually.")
     with col2:
         name = st.text_input("Package name", placeholder="e.g., lodash, numpy")
     with col3:
         version = st.text_input("Version", placeholder="e.g., 4.17.21")
+    
+    if ecosystem == NON_REGISTRY_ECO:
+        st.caption("ℹ️ 'Other' selected: no automatic license/CVE lookup. You'll still click "
+                   "Fetch to create the record, then fill metadata manually. Best for tools like "
+                   "Jira, licensed IDEs, or internal scripts that aren't in a public registry.")
     
     item_type = st.radio(
         "Save to which inventory?",
@@ -1599,7 +1628,12 @@ with tab1:
     record = st.session_state.get(metadata_key)
     if record:
         fetched_at = st.session_state.get(f"{metadata_key}_ts", "")
-        st.success(f"✅ Metadata fetched at {fetched_at}")
+        is_non_registry = (record.get("Ecosystem") == NON_REGISTRY_ECO)
+        if is_non_registry:
+            st.info("🛠️ Non-registry item — automatic enrichment skipped by design. "
+                    "Fill Publisher, License, and any known issues manually below.")
+        else:
+            st.success(f"✅ Metadata fetched at {fetched_at}")
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("License", record.get("License", "—"))
@@ -1621,12 +1655,15 @@ with tab1:
         #  - core metadata came back blank, OR
         #  - a diagnostic reports an actual API error/rate-limit.
         # A clean package with 0 CVEs is NOT a problem and must not trigger this.
+        # Non-registry items skip enrichment by design — never treat that as an error.
         has_error_diag = any(
             ("HTTP" in d) or ("error" in d.lower()) or ("rate-limit" in d.lower())
             or ("not supported" in d.lower()) or ("not found" in d.lower())
             for d in diag
         )
-        if blank_meta or has_error_diag:
+        if is_non_registry:
+            pass  # handled by the info banner above; no diagnostics/clean-result message
+        elif blank_meta or has_error_diag:
             with st.expander("ℹ️ Some fields are blank — here's why (diagnostics)"):
                 for d in diag:
                     st.write(f"• {d}")
@@ -2793,4 +2830,4 @@ with tab6:
                 st.rerun()
 
 st.divider()
-st.caption("v6.6 • AI suggest for tool validation (approach justification, evidence, output verification) + Tool enrichment parity with SOUP • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
+st.caption("v6.6.1 • 'Other' ecosystem for non-registry tools (Jira, IDEs, scripts) — enrichment skipped, manual metadata preserved on refresh • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
