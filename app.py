@@ -1,23 +1,29 @@
 """
-SOUP & Tool Agent v6 — Bug Fixes + Periodic Review
+SOUP & Tool Agent v6.5 — Enrichment Bug Fixes
 ===================================================
 For QARA professionals managing SOUP (IEC 62304 §5.3.3) and Tools
 (§5.1.4 + FDA CSA — Final, Sept 2025, updated Feb 2026).
 
-v6 changes:
-  - Fix: Refresh logging now reliable (weekly digest format)
-  - Fix: Tool vs SOUP Justification save/display verified
-  - Fix: CVE Plain English now available in Tool Review (parity)
-  - Fix: CVE explainer loops through ALL CVEs, not just the first
-  - Fix: Usage Context Justification save/display verified
-  - Fix: FDA CSA references updated to 2025/2026 Final
-  - NEW: Risk-based periodic review system
-       Class C / High-risk: 6 months
-       Class B / Medium-risk: 12 months
-       Class A / Low-risk: 24 months
-  - NEW: Change-triggered re-review (intended use OR usage context change)
-  - NEW: Overdue / due-soon visual alerts
-  - NEW: Last refresh age warning in sidebar
+v6.5 changes (this patch — fixes blank metadata + missing CVEs reported on v6.4):
+  - Fix: deps.dev system path casing (PyPI/Maven/NuGet/Cargo were 404ing) —
+         Publisher / License / Repository / Description / Release Date now populate
+  - Fix: Publisher no longer reads a non-existent 'registries' field; derived from
+         source-repo owner (e.g. github.com/pallets/flask -> 'pallets') or registry
+  - Fix: OSV PyPI name normalization (PEP 503) — 'Pillow', 'opencv_python' etc.
+         no longer return zero vulns
+  - Fix: CVSS fallback parsed OSV vector STRINGS as numbers (always 0.0) — replaced
+         with a self-contained, dependency-free CVSS 3.1 base-score calculator,
+         validated against FIRST.org reference scores
+  - Fix: NVD 403/429 rate-limiting no longer swallowed silently; optional
+         'nvd_api_key' secret supported to raise the request limit
+  - NEW: Enrichment diagnostics — silent 'except: pass' failures now record a reason,
+         surfaced in the Add Item screen so blank fields explain themselves
+  - Note: deps.dev has no RubyGems support; now flagged explicitly
+
+v6.4 (prior): CSA process-risk framing, IEC 62304 hazard-based safety class,
+              AI suggest centralized in Add Item, OSV Cargo mapping, GHSA/PYSEC support.
+v6.0–v6.3 (prior): periodic review system, safe_int/safe_float, batched Sheets
+              writes, Gemini exponential backoff.
 """
 
 import streamlit as st
@@ -737,16 +743,66 @@ Respond with a JSON object only (no markdown, no preamble):
 # EXTERNAL APIs (deps.dev, OSV, NVD)
 # ============================================================
 
-def fetch_depsdev(eco, name, version):
+def _diag(msg):
+    """Record an enrichment diagnostic so the UI can surface WHY a field was blank
+    instead of silently swallowing the failure. Reset at the start of each enrich()."""
     try:
-        r = requests.get(f"https://api.deps.dev/v3/systems/{eco}/packages/{name}/versions/{version}", timeout=15)
-        if r.status_code == 200: return r.json()
-    except Exception: pass
+        st.session_state.setdefault("_enrich_diag", []).append(msg)
+    except Exception:
+        pass
+    print(f"[enrich diag] {msg}")
+
+# deps.dev requires the system path segment in a SPECIFIC casing.
+# Our internal ECOSYSTEMS keys ("PyPI", "Maven", ...) do NOT match deps.dev's
+# expected values, so every non-npm/non-go lookup was 404ing silently.
+# Valid deps.dev systems: npm, go, maven, pypi, nuget, cargo.
+# (deps.dev has NO RubyGems support — handled explicitly below.)
+DEPSDEV_SYSTEM_MAP = {
+    "npm": "npm",
+    "PyPI": "pypi",
+    "Maven": "maven",
+    "NuGet": "nuget",
+    "Go": "go",
+    "Cargo": "cargo",
+    "RubyGems": None,   # not supported by deps.dev
+}
+
+def _depsdev_pkg_name(eco, name):
+    """deps.dev expects URL-encoded names. Maven uses group:artifact which must
+    keep its colon; PyPI names are normalized lowercase by deps.dev anyway."""
+    from urllib.parse import quote
+    return quote(name, safe=":")
+
+def fetch_depsdev(eco, name, version):
+    """Fetch version-level metadata. Returns {} and records a reason on failure.
+    Reasons are stashed in st.session_state['_enrich_diag'] for surfacing in UI."""
+    system = DEPSDEV_SYSTEM_MAP.get(eco, eco.lower())
+    if system is None:
+        _diag(f"deps.dev: ecosystem '{eco}' is not supported by deps.dev (e.g. RubyGems).")
+        return {}
+    enc = _depsdev_pkg_name(eco, name)
+    url = f"https://api.deps.dev/v3/systems/{system}/packages/{enc}/versions/{version}"
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 404:
+            _diag(f"deps.dev: version not found (404) for {system}/{name}@{version}. "
+                  f"Check the exact package name and version string.")
+        else:
+            _diag(f"deps.dev: HTTP {r.status_code} for {system}/{name}@{version}.")
+    except Exception as e:
+        _diag(f"deps.dev: request error for {system}/{name}@{version}: {str(e)[:120]}")
     return {}
 
 def fetch_depsdev_latest(eco, name):
+    system = DEPSDEV_SYSTEM_MAP.get(eco, eco.lower())
+    if system is None:
+        return ""
+    enc = _depsdev_pkg_name(eco, name)
+    url = f"https://api.deps.dev/v3/systems/{system}/packages/{enc}"
     try:
-        r = requests.get(f"https://api.deps.dev/v3/systems/{eco}/packages/{name}", timeout=15)
+        r = requests.get(url, timeout=15)
         if r.status_code == 200:
             data = r.json()
             versions = data.get("versions", [])
@@ -757,6 +813,16 @@ def fetch_depsdev_latest(eco, name):
                 return versions[-1].get("versionKey", {}).get("version", "")
     except Exception: pass
     return ""
+
+def _normalize_pkg_name_for_osv(eco, name):
+    """OSV is case- and format-sensitive. PyPI names must be normalized per PEP 503
+    (lowercase, runs of [-_.] collapsed to a single '-'), or OSV returns ZERO vulns
+    for packages like 'Pillow', 'opencv_python', 'ruamel.yaml'. npm scoped names and
+    Maven group:artifact are passed through unchanged."""
+    if eco == "PyPI":
+        import re
+        return re.sub(r"[-_.]+", "-", name).lower()
+    return name
 
 def fetch_osv_vulns(eco, name, version):
     # OSV.dev uses specific ecosystem names that differ from common naming
@@ -770,16 +836,41 @@ def fetch_osv_vulns(eco, name, version):
         "RubyGems": "RubyGems",
     }
     osv_eco = OSV_ECOSYSTEM_MAP.get(eco, eco)
+    osv_name = _normalize_pkg_name_for_osv(eco, name)
     try:
         r = requests.post("https://api.osv.dev/v1/query",
-                          json={"package": {"name": name, "ecosystem": osv_eco}, "version": version}, timeout=15)
-        if r.status_code == 200: return r.json().get("vulns", [])
-    except Exception: pass
+                          json={"package": {"name": osv_name, "ecosystem": osv_eco},
+                                "version": version}, timeout=15)
+        if r.status_code == 200:
+            vulns = r.json().get("vulns", [])
+            if not vulns:
+                _diag(f"OSV: query succeeded but returned 0 vulns for "
+                      f"{osv_eco}/{osv_name}@{version}. If NVD lists CVEs, verify the "
+                      f"version string is exact (OSV matches by precise version range).")
+            return vulns
+        else:
+            _diag(f"OSV: HTTP {r.status_code} for {osv_eco}/{osv_name}@{version}. "
+                  f"Response: {r.text[:150]}")
+    except Exception as e:
+        _diag(f"OSV: request error for {osv_eco}/{osv_name}@{version}: {str(e)[:120]}")
     return []
 
-def fetch_nvd_cvss(cve_id):
+def _nvd_headers():
+    """NVD anonymous access is throttled to ~5 req / 30s and returns 403 when
+    exceeded. With an API key the limit is ~50 req / 30s. Add 'nvd_api_key' to
+    Streamlit secrets (free from nvd.nist.gov/developers/request-an-api-key)."""
     try:
-        r = requests.get(f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}", timeout=15)
+        key = st.secrets.get("nvd_api_key", "")
+    except Exception:
+        key = ""
+    return {"apiKey": key} if key else {}
+
+def fetch_nvd_cvss(cve_id):
+    headers = _nvd_headers()
+    try:
+        r = requests.get(
+            f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}",
+            headers=headers, timeout=20)
         if r.status_code == 200:
             data = r.json()
             for item in data.get("vulnerabilities", []):
@@ -787,7 +878,13 @@ def fetch_nvd_cvss(cve_id):
                 for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                     if key in metrics and metrics[key]:
                         return metrics[key][0].get("cvssData", {}).get("baseScore", 0.0)
-    except Exception: pass
+        elif r.status_code in (403, 429):
+            _diag(f"NVD: rate-limited ({r.status_code}) on {cve_id}. Add 'nvd_api_key' "
+                  f"to secrets to raise the limit; CVSS may fall back to OSV's score.")
+        else:
+            _diag(f"NVD: HTTP {r.status_code} for {cve_id}.")
+    except Exception as e:
+        _diag(f"NVD: request error for {cve_id}: {str(e)[:120]}")
     return 0.0
 
 def severity_label(s):
@@ -844,7 +941,85 @@ def classify_safety_class(answers):
 # ENRICHMENT
 # ============================================================
 
+def _cvss3_base_from_vector(vec):
+    """Compute a CVSS 3.0/3.1 base score from a vector string with NO external
+    dependency (so nothing new to add to requirements.txt). Implements the
+    standard FIRST.org CVSS v3.1 base formula, including the official integer-based
+    Roundup (math.ceil introduces float-boundary errors). Returns 0.0 if unparseable."""
+    def _roundup(x):
+        i = round(x * 100000)
+        return i / 100000.0 if i % 10000 == 0 else (int(i / 10000) + 1) / 10.0
+    try:
+        parts = dict(p.split(":") for p in vec.split("/") if ":" in p and not p.startswith("CVSS"))
+        AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}[parts["AV"]]
+        AC = {"L": 0.77, "H": 0.44}[parts["AC"]]
+        UI = {"N": 0.85, "R": 0.62}[parts["UI"]]
+        scope_changed = parts["S"] == "C"
+        PR = {"N": 0.85,
+              "L": 0.68 if scope_changed else 0.62,
+              "H": 0.50 if scope_changed else 0.27}[parts["PR"]]
+        imp_map = {"N": 0.0, "L": 0.22, "H": 0.56}
+        C, I, A = imp_map[parts["C"]], imp_map[parts["I"]], imp_map[parts["A"]]
+        iscbase = 1 - ((1 - C) * (1 - I) * (1 - A))
+        if scope_changed:
+            impact = 7.52 * (iscbase - 0.029) - 3.25 * ((iscbase - 0.02) ** 15)
+        else:
+            impact = 6.42 * iscbase
+        if impact <= 0:
+            return 0.0
+        exploitability = 8.22 * AV * AC * PR * UI
+        raw = (impact + exploitability)
+        if scope_changed:
+            raw = 1.08 * raw
+        return _roundup(min(raw, 10.0))
+    except Exception:
+        return 0.0
+
+def _cvss_from_osv_severity(severity_list):
+    """OSV 'severity' entries look like {'type': 'CVSS_V3', 'score': '<vector>'}.
+    The score is a CVSS vector STRING, not a number — the old code float()'d it and
+    always got 0.0. Parse the numeric base score from the vector instead."""
+    if not severity_list:
+        return 0.0
+    for sev in severity_list:
+        vec = sev.get("score", "")
+        stype = sev.get("type", "")
+        if not isinstance(vec, str):
+            return safe_float(vec)
+        if isinstance(vec, str) and vec.startswith("CVSS:3"):
+            s = _cvss3_base_from_vector(vec)
+            if s > 0:
+                return s
+        # CVSS_V4 vectors are more complex; record and skip precise scoring.
+        if stype == "CVSS_V4":
+            _diag("OSV reported a CVSS v4 vector; precise score not computed "
+                  "(v3 scoring is exact). Severity shown may understate v4 cases.")
+    return 0.0
+
+def _derive_publisher(eco, repo_url, homepage):
+    """deps.dev has no publisher field. Derive a sensible one from the source repo
+    owner (e.g. github.com/pallets/flask -> 'pallets'), else fall back to the
+    ecosystem registry name."""
+    src = repo_url or homepage or ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(src)
+        host = p.netloc.lower()
+        parts = [seg for seg in p.path.split("/") if seg]
+        if ("github.com" in host or "gitlab.com" in host or "bitbucket.org" in host) and parts:
+            return parts[0]  # the org/owner
+    except Exception:
+        pass
+    return {
+        "npm": "npm registry", "PyPI": "PyPI", "Maven": "Maven Central",
+        "NuGet": "NuGet Gallery", "Go": "Go modules", "Cargo": "crates.io",
+        "RubyGems": "RubyGems.org",
+    }.get(eco, eco)
+
 def enrich(eco, name, version, item_type="SOUP"):
+    # Reset diagnostics for this enrichment run so the UI shows only current reasons.
+    st.session_state["_enrich_diag"] = []
+
     meta = fetch_depsdev(eco, name, version)
     latest = fetch_depsdev_latest(eco, name)
     is_outdated = bool(latest and latest != version)
@@ -869,21 +1044,16 @@ def enrich(eco, name, version, item_type="SOUP"):
             primary = v.get("id", "Unknown")
         
         score = 0.0
-        # Only query NVD if we have a CVE ID (NVD doesn't index GHSA/PYSEC)
+        # Query NVD only if we have a CVE ID (NVD doesn't index GHSA/PYSEC)
         if cve_ids:
             score = fetch_nvd_cvss(cve_ids[0])
             time.sleep(0.6)
-        else:
-            # Try to extract CVSS from OSV's own severity field
-            severity_obj = v.get("severity", [])
-            if severity_obj:
-                for sev in severity_obj:
-                    if sev.get("type") in ("CVSS_V3", "CVSS_V4"):
-                        try:
-                            # CVSS vector starts with score in some formats
-                            score = safe_float(sev.get("score", 0))
-                            if score > 0: break
-                        except Exception: pass
+        # Fall back to OSV's own severity if NVD gave nothing (0.0) — covers both the
+        # no-CVE case AND the NVD-rate-limited case. OSV's CVSS_V3/V4 'score' is a
+        # VECTOR STRING (e.g. "CVSS:3.1/AV:N/AC:L/..."), not a number, so we must
+        # parse the base score out of it rather than float() the whole string.
+        if score == 0.0:
+            score = _cvss_from_osv_severity(v.get("severity", []))
         
         cves.append({
             "id": primary, "summary": v.get("summary", "")[:200],
@@ -891,11 +1061,18 @@ def enrich(eco, name, version, item_type="SOUP"):
         })
         if score > highest_cvss: highest_cvss = score
     
-    licenses = meta.get("licenses", [])
+    # ---- deps.dev metadata extraction (v3 version endpoint) ----
+    # licenses: list of SPDX strings. links: list of {label, url}. There is NO
+    # 'registries' field, so Publisher derives from the repo host or the ecosystem.
+    licenses = meta.get("licenses", []) or []
     license_str = ", ".join(licenses) if licenses else "Unknown"
-    links = meta.get("links", [])
-    repo_url = next((l["url"] for l in links if l.get("label") == "SOURCE_REPO"), "")
-    homepage = next((l["url"] for l in links if l.get("label") == "HOMEPAGE"), "")
+    links = meta.get("links", []) or []
+    repo_url = next((l.get("url", "") for l in links if l.get("label") == "SOURCE_REPO"), "")
+    homepage = next((l.get("url", "") for l in links if l.get("label") == "HOMEPAGE"), "")
+    issues = next((l.get("url", "") for l in links if l.get("label") == "ISSUE_TRACKER"), "")
+    publisher = _derive_publisher(eco, repo_url, homepage)
+    description = (meta.get("description") or "")[:500] or f"{name} {version}"
+    release_date = meta.get("publishedAt", "") or meta.get("publishedDate", "")
     
     cve_text = "\n".join([
         f"• {c['id']} [{c['severity']}, CVSS {c['cvss']}]: {c['summary']}"
@@ -908,11 +1085,11 @@ def enrich(eco, name, version, item_type="SOUP"):
     base = {
         "Name": name, "Version": version, "Ecosystem": eco,
         "Tool vs SOUP Justification": "",
-        "Publisher": meta.get("registries", [eco])[0] if meta.get("registries") else eco,
+        "Publisher": publisher,
         "License": license_str,
-        "Description": meta.get("description", "")[:500] or f"{name} {version}",
+        "Description": description,
         "Repository URL": repo_url, "Homepage": homepage,
-        "Release Date": meta.get("publishedAt", ""),
+        "Release Date": release_date,
         "Latest Version": latest,
         "Outdated": "Yes" if is_outdated else "No",
         "CVE Count": len(cves), "Highest CVSS": highest_cvss,
@@ -1364,6 +1541,23 @@ with tab1:
         c2.metric("CVEs", record.get("CVE Count", 0))
         c3.metric("Max CVSS", f"{record.get('Highest CVSS', 0):.1f}" if record.get("Highest CVSS") else "—")
         c4.metric("Outdated", record.get("Outdated", "—"))
+        
+        st.caption(
+            f"**Publisher:** {record.get('Publisher','—')} · "
+            f"**Repo:** {record.get('Repository URL') or '—'} · "
+            f"**Released:** {record.get('Release Date') or '—'}"
+        )
+        
+        # Surface WHY fields may be blank, instead of silently leaving them empty.
+        diag = st.session_state.get("_enrich_diag", [])
+        blank_meta = (record.get("License") in ("", "Unknown")
+                      and not record.get("Repository URL"))
+        if diag and (blank_meta or record.get("CVE Count", 0) == 0):
+            with st.expander("ℹ️ Why are some fields blank? (enrichment diagnostics)"):
+                for d in diag:
+                    st.write(f"• {d}")
+                st.caption("Tip: verify the exact package name and version, and add "
+                           "an `nvd_api_key` secret to avoid NVD rate limits.")
         
         if record.get("CVE Count", 0) > 0:
             st.warning(f"⚠️ {record['CVE Count']} vulnerabilities found.")
@@ -2462,4 +2656,4 @@ with tab6:
                 st.rerun()
 
 st.divider()
-st.caption("v6.4 • CSA process risk + IEC 62304 hazard-based safety class + AI in Add Item • OSV ecosystem fix • GHSA/PYSEC support • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
+st.caption("v6.5 • Enrichment fixes: deps.dev casing + OSV PyPI normalization + dependency-free CVSS 3.1 + NVD key support + diagnostics • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
