@@ -1,10 +1,26 @@
 """
-SOUP & Tool Agent v6.5.1 — Enrichment Bug Fixes + Clearer Diagnostics
+SOUP & Tool Agent v6.6 — AI Validation Suggestions + Tool Enrichment Parity
 ===================================================
 For QARA professionals managing SOUP (IEC 62304 §5.3.3) and Tools
 (§5.1.4 + FDA CSA — Final, Sept 2025, updated Feb 2026).
 
-v6.5.1 changes (this patch):
+v6.6 changes (this release):
+  - Confirmed: Tools use the SAME enrich() function as SOUP, so the v6.5/v6.5.1
+    enrichment fixes (deps.dev casing, OSV PyPI normalization, dependency-free
+    CVSS 3.1, NVD key support, diagnostics) already apply to Tools. No duplication.
+  - NEW: AI suggest for Validation Approach Justification (Tool Review tab)
+  - NEW: AI suggest for Validation Evidence (Tool Review tab)
+  - NEW: AI suggest for Tool Output Verification (Tool Review tab)
+    Design note: these AI buttons live in the Tool Review tab (a deliberate
+    exception to "AI only in Add Item"), because they depend on the Tool Risk
+    Level and Validation Approach set by the guided picker in Review, not Add Item.
+    Rule-based suggest_validation_approach() still provides the safe regulatory
+    default; AI enriches the package-specific prose on top. All AI output is tagged
+    [AI-suggested], fully editable, prefix stripped before saving. Evidence carries
+    an explicit "verify every claim" caution so unverified adoption figures don't
+    enter a regulated record.
+
+v6.5.1 changes (patch):
   - Fix: A clean package with 0 known vulnerabilities is no longer presented as a
          possible error. The diagnostics panel now appears ONLY for genuine problems
          (blank metadata or an actual API error/rate-limit). Clean packages get a
@@ -656,6 +672,46 @@ Describe 2-3 specific failure scenarios for this tool and their concrete impact 
 
 Format as a single paragraph (3-4 sentences). Output ONLY the paragraph."""
     return call_gemini(prompt, max_tokens=300)
+
+def ai_validation_approach_justification(name, description, risk_level, approach, tool_function=""):
+    prompt = f"""You are a QARA expert documenting tool validation per FDA CSA (Computer Software Assurance) guidance.
+
+Tool: {name}
+Description: {description}
+Tool function in process: {tool_function or "Not specified"}
+Process risk level: {risk_level}
+Chosen validation approach: {approach}
+
+Write a 2-3 sentence justification explaining WHY this validation approach is appropriate and sufficient for this specific tool at this risk level. Apply the FDA CSA risk-based, least-burdensome principle. Be specific to what this tool actually does — do not be generic.
+
+Output ONLY the justification paragraph, no preamble."""
+    return call_gemini(prompt, max_tokens=300)
+
+def ai_validation_evidence(name, version, description, risk_level, approach, tool_function=""):
+    prompt = f"""You are a QARA expert documenting tool validation evidence per FDA CSA (Computer Software Assurance) guidance.
+
+Tool: {name} {version}
+Description: {description}
+Tool function in process: {tool_function or "Not specified"}
+Process risk level: {risk_level or "Not specified"}
+Validation approach: {approach or "Not specified"}
+
+Suggest concrete, realistic validation evidence appropriate for this tool and approach. Apply the FDA CSA least-burdensome principle — for low-risk mature tools, lightweight vendor-reliance evidence is appropriate; for higher risk, suggest documented test evidence. Where relevant, mention practical signals like widespread adoption, an established release history, a smoke/sanity check confirming expected behaviour, or documented test cases. Be specific to what THIS tool does. Do NOT invent specific numbers as if verified — phrase any adoption signal as something to confirm (e.g. "confirm download/adoption figures from the registry").
+
+Format as a single paragraph (3-4 sentences). Output ONLY the paragraph, no preamble."""
+    return call_gemini(prompt, max_tokens=350)
+
+def ai_tool_output_verification(name, description, tool_function=""):
+    prompt = f"""You are a QARA expert documenting how a development tool's output is verified, per FDA CSA guidance.
+
+Tool: {name}
+Description: {description}
+Tool function in process: {tool_function or "Not specified"}
+
+Describe a practical way to verify that THIS tool's output is correct in normal use — i.e., how a downstream check would catch a tool malfunction. Be concrete and specific to the tool's actual output (e.g., "compiled bundle is exercised by the existing test suite", "linter findings are reviewed by a human before merge", "generated code is covered by unit tests"). Do not be generic.
+
+Format as 1-2 sentences. Output ONLY the text, no preamble."""
+    return call_gemini(prompt, max_tokens=250)
 
 def ai_cve_plain_english(cve_id, cve_summary, cvss_score):
     prompt = f"""You are explaining a security vulnerability to a non-technical QARA professional.
@@ -2564,18 +2620,74 @@ with tab6:
         validation_approach = st.selectbox("Validation Approach", [""] + VALIDATION_APPROACHES,
             index=([""] + VALIDATION_APPROACHES).index(default_va) if default_va in ([""] + VALIDATION_APPROACHES) else 0,
             key=f"va_{tidx}")
-        validation_approach_just = st.text_area("Justification",
-            value=approach_just if approach_just else item.get("Validation Approach Justification", ""),
-            height=80, key=f"vaj_{tidx}")
+        
+        # Validation Approach Justification — rule-based default + optional AI enrichment.
+        # Lives here (not Add Item) because it depends on the Tool Risk Level set above.
+        vaj_widget_key = f"vaj_{tidx}"
+        vaj_existing = item.get("Validation Approach Justification", "") or approach_just
+        if vaj_widget_key not in st.session_state:
+            st.session_state[vaj_widget_key] = vaj_existing
+        if gemini_available():
+            if st.button("✨ AI suggest Justification", key=f"vaj_ai_{tidx}"):
+                if not risk_final or not validation_approach:
+                    st.warning("Set Tool Risk Level and Validation Approach first.")
+                else:
+                    with st.spinner("Asking Gemini..."):
+                        sug = ai_validation_approach_justification(
+                            item.get("Name", ""), item.get("Description", ""),
+                            risk_final, validation_approach, tool_func)
+                    if sug.startswith("ERROR"):
+                        st.error(f"❌ {sug}")
+                    else:
+                        st.session_state[vaj_widget_key] = f"[AI-suggested] {sug}"
+                        st.rerun()
+        validation_approach_just = st.text_area("Justification", key=vaj_widget_key, height=80)
+        if validation_approach_just.startswith("[AI-suggested]"):
+            st.caption("✨ Originally AI-suggested. Review carefully before approval.")
         
         st.divider()
         st.markdown("### Validation Evidence & Controls")
+        
+        # Validation Evidence — optional AI draft
+        ve_widget_key = f"ve_{tidx}"
+        if ve_widget_key not in st.session_state:
+            st.session_state[ve_widget_key] = item.get("Validation Evidence", "")
+        if gemini_available():
+            if st.button("✨ AI suggest Validation Evidence", key=f"ve_ai_{tidx}"):
+                with st.spinner("Asking Gemini..."):
+                    sug = ai_validation_evidence(
+                        item.get("Name", ""), str(item.get("Version", "")),
+                        item.get("Description", ""), risk_final, validation_approach, tool_func)
+                if sug.startswith("ERROR"):
+                    st.error(f"❌ {sug}")
+                else:
+                    st.session_state[ve_widget_key] = f"[AI-suggested] {sug}"
+                    st.rerun()
         validation_evidence = st.text_area("Validation Evidence",
-            value=item.get("Validation Evidence", ""),
-            placeholder="e.g., Industry-standard tool, 50M+ downloads, smoke test confirms behavior",
-            height=100, key=f"ve_{tidx}")
+            key=ve_widget_key, height=100,
+            placeholder="e.g., Industry-standard tool, widely adopted, smoke test confirms behavior")
+        if validation_evidence.startswith("[AI-suggested]"):
+            st.caption("✨ Originally AI-suggested. Verify every claim (e.g. adoption figures) before approval.")
+        
+        # Tool Output Verification — optional AI draft
+        tov_widget_key = f"tov_{tidx}"
+        if tov_widget_key not in st.session_state:
+            st.session_state[tov_widget_key] = item.get("Tool Output Verification", "")
+        if gemini_available():
+            if st.button("✨ AI suggest Tool Output Verification", key=f"tov_ai_{tidx}"):
+                with st.spinner("Asking Gemini..."):
+                    sug = ai_tool_output_verification(
+                        item.get("Name", ""), item.get("Description", ""), tool_func)
+                if sug.startswith("ERROR"):
+                    st.error(f"❌ {sug}")
+                else:
+                    st.session_state[tov_widget_key] = f"[AI-suggested] {sug}"
+                    st.rerun()
         tool_output_verif = st.text_area("Tool Output Verification",
-            value=item.get("Tool Output Verification", ""), height=80, key=f"tov_{tidx}")
+            key=tov_widget_key, height=80)
+        if tool_output_verif.startswith("[AI-suggested]"):
+            st.caption("✨ Originally AI-suggested. Review carefully before approval.")
+        
         config_mgmt = st.text_area("Configuration Management",
             value=item.get("Configuration Management", ""), height=80, key=f"cm_{tidx}")
         
@@ -2609,6 +2721,9 @@ with tab6:
             if st.button("💾 Save", type="primary", key=f"tsave_{tidx}"):
                 clean_rj = risk_just_final.replace("[AI-suggested] ", "")
                 clean_imp = impact.replace("[AI-suggested] ", "")
+                clean_vaj = validation_approach_just.replace("[AI-suggested] ", "")
+                clean_ve = validation_evidence.replace("[AI-suggested] ", "")
+                clean_tov = tool_output_verif.replace("[AI-suggested] ", "")
                 
                 # Compute next review date based on risk level (or keep existing if unchanged)
                 tool_review_cadence_t = default_cadence_for_tool(risk_final)
@@ -2638,9 +2753,9 @@ with tab6:
                     "Tool Risk Justification": clean_rj,
                     "Impact if Tool Fails": clean_imp,
                     "Validation Approach": validation_approach,
-                    "Validation Approach Justification": validation_approach_just,
-                    "Validation Evidence": validation_evidence,
-                    "Tool Output Verification": tool_output_verif,
+                    "Validation Approach Justification": clean_vaj,
+                    "Validation Evidence": clean_ve,
+                    "Tool Output Verification": clean_tov,
                     "Configuration Management": config_mgmt,
                     "Validation Status": val_status,
                     "Last Validation Date": last_val,
@@ -2666,7 +2781,8 @@ with tab6:
                             st.error(f"❌ Save failed: {err_str[:200]}")
                 if save_ok:
                     # Clear widget state so next render reflects the saved (clean) values
-                    for k in [f"rjf_{tidx}", f"imp_{tidx}", f"tool_cve_pe_{tidx}"]:
+                    for k in [f"rjf_{tidx}", f"imp_{tidx}", f"tool_cve_pe_{tidx}",
+                              f"vaj_{tidx}", f"ve_{tidx}", f"tov_{tidx}"]:
                         if k in st.session_state: del st.session_state[k]
                     st.success("✅ Saved.")
                     st.rerun()
@@ -2677,4 +2793,4 @@ with tab6:
                 st.rerun()
 
 st.divider()
-st.caption("v6.5.1 • Enrichment fixes + clearer diagnostics (clean packages no longer flagged as errors) • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
+st.caption("v6.6 • AI suggest for tool validation (approach justification, evidence, output verification) + Tool enrichment parity with SOUP • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
