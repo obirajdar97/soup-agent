@@ -1,10 +1,17 @@
 """
-SOUP & Tool Agent v6.5 — Enrichment Bug Fixes
+SOUP & Tool Agent v6.5.1 — Enrichment Bug Fixes + Clearer Diagnostics
 ===================================================
 For QARA professionals managing SOUP (IEC 62304 §5.3.3) and Tools
 (§5.1.4 + FDA CSA — Final, Sept 2025, updated Feb 2026).
 
-v6.5 changes (this patch — fixes blank metadata + missing CVEs reported on v6.4):
+v6.5.1 changes (this patch):
+  - Fix: A clean package with 0 known vulnerabilities is no longer presented as a
+         possible error. The diagnostics panel now appears ONLY for genuine problems
+         (blank metadata or an actual API error/rate-limit). Clean packages get a
+         plain "No known vulnerabilities found (clean result)" confirmation.
+  - Reworded the OSV zero-vuln note to be reassuring rather than alarming.
+
+v6.5 changes (fixes blank metadata + missing CVEs reported on v6.4):
   - Fix: deps.dev system path casing (PyPI/Maven/NuGet/Cargo were 404ing) —
          Publisher / License / Repository / Description / Release Date now populate
   - Fix: Publisher no longer reads a non-existent 'registries' field; derived from
@@ -844,9 +851,11 @@ def fetch_osv_vulns(eco, name, version):
         if r.status_code == 200:
             vulns = r.json().get("vulns", [])
             if not vulns:
-                _diag(f"OSV: query succeeded but returned 0 vulns for "
-                      f"{osv_eco}/{osv_name}@{version}. If NVD lists CVEs, verify the "
-                      f"version string is exact (OSV matches by precise version range).")
+                _diag(f"OSV: no known vulnerabilities for {osv_eco}/{osv_name}@{version}. "
+                      f"This usually means the package version is clean — a 0 result is a "
+                      f"valid, expected answer for up-to-date packages. "
+                      f"Only double-check the name/version spelling if you specifically "
+                      f"expected this version to have a CVE.")
             return vulns
         else:
             _diag(f"OSV: HTTP {r.status_code} for {osv_eco}/{osv_name}@{version}. "
@@ -1552,12 +1561,24 @@ with tab1:
         diag = st.session_state.get("_enrich_diag", [])
         blank_meta = (record.get("License") in ("", "Unknown")
                       and not record.get("Repository URL"))
-        if diag and (blank_meta or record.get("CVE Count", 0) == 0):
-            with st.expander("ℹ️ Why are some fields blank? (enrichment diagnostics)"):
+        # Show the panel only when something genuinely looks wrong:
+        #  - core metadata came back blank, OR
+        #  - a diagnostic reports an actual API error/rate-limit.
+        # A clean package with 0 CVEs is NOT a problem and must not trigger this.
+        has_error_diag = any(
+            ("HTTP" in d) or ("error" in d.lower()) or ("rate-limit" in d.lower())
+            or ("not supported" in d.lower()) or ("not found" in d.lower())
+            for d in diag
+        )
+        if blank_meta or has_error_diag:
+            with st.expander("ℹ️ Some fields are blank — here's why (diagnostics)"):
                 for d in diag:
                     st.write(f"• {d}")
-                st.caption("Tip: verify the exact package name and version, and add "
-                           "an `nvd_api_key` secret to avoid NVD rate limits.")
+                st.caption("Tip: verify the exact package name and version. Adding an "
+                           "`nvd_api_key` secret avoids NVD rate limits.")
+        elif record.get("CVE Count", 0) == 0:
+            # Clean package — reassure, don't alarm.
+            st.success("✅ No known vulnerabilities found for this version (clean result).")
         
         if record.get("CVE Count", 0) > 0:
             st.warning(f"⚠️ {record['CVE Count']} vulnerabilities found.")
@@ -2656,4 +2677,4 @@ with tab6:
                 st.rerun()
 
 st.divider()
-st.caption("v6.5 • Enrichment fixes: deps.dev casing + OSV PyPI normalization + dependency-free CVSS 3.1 + NVD key support + diagnostics • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
+st.caption("v6.5.1 • Enrichment fixes + clearer diagnostics (clean packages no longer flagged as errors) • IEC 62304 §5.3.3 + §5.1.4 + FDA CSA 2025/2026")
